@@ -1,5 +1,5 @@
 # fetch_et.py — GDPR fines quarterly export for Power BI (GitHub CSV route)
-# VERSION_BANNER: ET_FETCH_V3_2025-12-12
+# VERSION_BANNER: ET_FETCH_V4_FILL_LAST4_2025-12-12
 
 import re
 import time
@@ -9,11 +9,12 @@ import pandas as pd
 import requests
 
 
-VERSION_BANNER = "ET_FETCH_V3_2025-12-12"
+VERSION_BANNER = "ET_FETCH_V4_FILL_LAST4_2025-12-12"
 
 BASE_URL = "https://www.enforcementtracker.com/"
 INSIGHTS_URL = "https://www.enforcementtracker.com/?insights"
 DEFAULT_JSON = "https://www.enforcementtracker.com/data.json"
+
 OUT_CSV = "gdpr_fines_quarterly_last4.csv"
 
 BROWSER_HEADERS = {
@@ -52,43 +53,28 @@ def looks_like_json(resp: requests.Response) -> bool:
 
 
 def extract_candidate_urls(html: str) -> list[str]:
-    """
-    Extract absolute + relative candidate URLs that might host JSON.
-    (More permissive than only 'https://...json' to avoid 0 candidates.)
-    """
     candidates = set()
 
-    # absolute URLs that include .json anywhere
     for m in re.findall(r"https?://[^\"'\s>]+", html, flags=re.IGNORECASE):
         m = m.strip().rstrip(");,")
         if ".json" in m.lower() or "/api" in m.lower() or "data" in m.lower():
             candidates.add(m)
 
-    # relative paths containing .json (e.g. /dataXXXX.json)
     for m in re.findall(r"(\/[^\"'\s>]+\.json[^\"'\s>]*)", html, flags=re.IGNORECASE):
         candidates.add(m.strip().rstrip(");,"))
 
-    # also catch bare filenames like dataXXXX.json in JS strings
     for m in re.findall(r"([A-Za-z0-9_\-]+\.json)", html, flags=re.IGNORECASE):
         candidates.add(m.strip().rstrip(");,"))
 
-    # normalize to absolute
     out = []
     for c in candidates:
-        if c.lower().startswith("http"):
-            out.append(c)
-        else:
-            out.append(urljoin(BASE_URL, c))
+        out.append(c if c.lower().startswith("http") else urljoin(BASE_URL, c))
     return sorted(set(out))
 
 
 def try_fetch_feed(session: requests.Session, url: str) -> dict | None:
-    """
-    Try URL with cache-busters; accept only dict JSON with 'data' array.
-    """
     ts = int(time.time())
     urls = [url]
-
     if "?" in url:
         urls += [f"{url}&_={ts}", f"{url}&v={ts}"]
     else:
@@ -108,20 +94,14 @@ def try_fetch_feed(session: requests.Session, url: str) -> dict | None:
 
 
 def discover_feed() -> tuple[str, dict]:
-    """
-    Returns (feed_url, json_dict)
-    """
     with requests.Session() as s:
-        # warm-up like a browser
         s.get(BASE_URL, headers=BROWSER_HEADERS, timeout=60)
         s.get(INSIGHTS_URL, headers=BROWSER_HEADERS, timeout=60)
 
-        # 1) try default
         js = try_fetch_feed(s, DEFAULT_JSON)
         if js is not None:
             return DEFAULT_JSON, js
 
-        # 2) discover from homepage HTML
         home_html = s.get(BASE_URL, headers=BROWSER_HEADERS, timeout=60).text
         candidates = extract_candidate_urls(home_html)
 
@@ -131,35 +111,60 @@ def discover_feed() -> tuple[str, dict]:
             if js is not None:
                 return u, js
 
-        raise RuntimeError("Could not discover a valid JSON feed endpoint (all candidates returned non-JSON/empty).")
+        raise RuntimeError("Could not discover a valid JSON feed endpoint.")
 
 
-def aggregate_last4(df: pd.DataFrame) -> pd.DataFrame:
+def last4_quarter_list(df_all: pd.DataFrame) -> list[str]:
     """
-    df must have columns: quarter (str), FineEUR (float)
-    Returns a 4-row dataframe (last 4 quarters, filled with 0 if missing).
+    Determine the global last 4 quarters from the full dataset.
+    Returns list like ["2025Q1","2025Q2","2025Q3","2025Q4"] (ascending).
     """
-    if df.empty:
+    if df_all.empty:
+        return []
+
+    # Use Period for reliable ordering
+    q_period = df_all["Date"].dt.to_period("Q")
+    max_q = q_period.max()
+    last4 = pd.period_range(max_q - 3, max_q, freq="Q")
+    return [str(p) for p in last4]
+
+
+def aggregate_for_dim(df_dim: pd.DataFrame, quarters_last4: list[str]) -> pd.DataFrame:
+    """
+    Always returns exactly 4 rows (for the given quarter list), filling missing with zeros.
+    """
+    if not quarters_last4:
         return pd.DataFrame(columns=["quarter", "count_fines", "sum_fines_mln"])
 
-    # ensure chronological order for quarters (Period strings sort ok as 'YYYYQn')
-    quarters_sorted = sorted(df["quarter"].unique())
-    last4 = quarters_sorted[-4:] if len(quarters_sorted) >= 4 else quarters_sorted
+    if df_dim.empty:
+        # return all zeros
+        return pd.DataFrame(
+            {
+                "quarter": quarters_last4,
+                "count_fines": [0] * 4,
+                "sum_fines_mln": [0.0] * 4,
+            }
+        )
 
-    d = df[df["quarter"].isin(last4)].copy()
+    df_dim = df_dim.copy()
+    df_dim["quarter"] = df_dim["Date"].dt.to_period("Q").astype(str)
 
-    out = (
-        d.groupby("quarter", as_index=False)
+    agg = (
+        df_dim.groupby("quarter", as_index=False)
         .agg(
             count_fines=("FineEUR", "size"),
             sum_fines_mln=("FineEUR", lambda x: x.sum() / 1_000_000.0),
         )
     )
 
-    # Fill missing quarters with 0 (so always stable for Power BI visuals)
-    out = out.set_index("quarter").reindex(last4, fill_value=0).reset_index()
+    # fill missing quarters with 0
+    agg = agg.set_index("quarter").reindex(quarters_last4, fill_value=0).reset_index()
 
-    return out[["quarter", "count_fines", "sum_fines_mln"]]
+    # ensure numeric types
+    agg["count_fines"] = agg["count_fines"].astype(int)
+    agg["sum_fines_mln"] = agg["sum_fines_mln"].astype(float)
+
+    return agg[["quarter", "count_fines", "sum_fines_mln"]]
 
 
 def main():
@@ -171,7 +176,7 @@ def main():
     rows = raw.get("data", [])
     df = pd.DataFrame(rows)
 
-    # Map indices as per your original approach: 2=Country, 4=Date, 5=Fine, 7=Sector
+    # 2=Country, 4=Date, 5=Fine, 7=Sector
     needed = {2: "Country", 4: "DateText", 5: "FineText", 7: "Sector"}
     for idx in needed:
         if idx not in df.columns:
@@ -185,22 +190,25 @@ def main():
     df["FineEUR"] = df["FineText"].map(parse_eur_amount)
     df = df.dropna(subset=["FineEUR"])
 
-    # IMPORTANT: quarter is an explicit column (no index tricks)
-    df["quarter"] = df["Date"].dt.to_period("Q").astype(str)
+    # Determine global last 4 quarters (from all cases, not just finance)
+    quarters_last4 = last4_quarter_list(df)
+    if len(quarters_last4) != 4:
+        raise RuntimeError("Could not determine last 4 quarters from dataset.")
 
     mask_fin = df["Sector"].astype(str).str.contains("finance", case=False, na=False)
     mask_nl = df["Country"].astype(str).str.contains("netherlands", case=False, na=False)
 
-    fin = aggregate_last4(df[mask_fin])
+    fin = aggregate_for_dim(df[mask_fin], quarters_last4)
     fin["dim"] = "Finance"
 
-    nl = aggregate_last4(df[mask_fin & mask_nl])
+    nl = aggregate_for_dim(df[mask_fin & mask_nl], quarters_last4)
     nl["dim"] = "NL_Finance"
 
     out = pd.concat([fin, nl], ignore_index=True)
     out.to_csv(OUT_CSV, index=False, encoding="utf-8")
 
     print(f"Saved {OUT_CSV} ({len(out)} rows)")
+    print(f"[INFO] Quarters used: {', '.join(quarters_last4)}")
 
 
 if __name__ == "__main__":
